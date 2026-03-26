@@ -6,12 +6,10 @@ export interface Config {
   openCodeApiKey: string;
   localApiKey: string;
   defaultModel: string;
-  allowedModels: string[];
 }
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_MODEL = 'big-pickle';
-const DEFAULT_ALLOWED_MODELS = ['big-pickle', 'minimax-m2.5-free', 'gpt-5-nano'];
 
 export function loadConfig(): Config {
   // Парсим CLI аргументы
@@ -32,7 +30,6 @@ export function loadConfig(): Config {
   const envDefaultModel = process.env.DEFAULT_MODEL;
   const openCodeApiKey = process.env.OPENCODE_API_KEY;
   const localApiKey = process.env.LOCAL_API_KEY;
-  const envAllowedModels = process.env.ALLOWED_MODELS;
 
   // Проверяем обязательные переменные
   if (!openCodeApiKey) {
@@ -51,7 +48,7 @@ export function loadConfig(): Config {
     const parsed = parseInt(envPort, 10);
     if (!isNaN(parsed)) port = parsed;
   }
-  if (values.port) {
+  if (values.port && typeof values.port === 'string') {
     const parsed = parseInt(values.port, 10);
     if (!isNaN(parsed)) port = parsed;
   }
@@ -60,13 +57,8 @@ export function loadConfig(): Config {
   if (envDefaultModel) {
     defaultModel = envDefaultModel;
   }
-  if (values.model) {
+  if (values.model && typeof values.model === 'string') {
     defaultModel = values.model;
-  }
-
-  let allowedModels = DEFAULT_ALLOWED_MODELS;
-  if (envAllowedModels) {
-    allowedModels = envAllowedModels.split(',').map(m => m.trim());
   }
 
   return {
@@ -74,6 +66,5 @@ export function loadConfig(): Config {
     openCodeApiKey,
     localApiKey,
     defaultModel,
-    allowedModels,
   };
 }

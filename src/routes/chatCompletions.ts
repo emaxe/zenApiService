@@ -27,12 +27,6 @@ export async function handleChatCompletions(
   // Подставляем дефолтную модель если не указана
   const model = body.model ?? config.defaultModel
 
-  // Проверяем допустимость модели
-  if (!config.allowedModels.includes(model)) {
-    sendError(res, 400, `Model '${model}' is not allowed. Allowed models: ${config.allowedModels.join(', ')}`, 'model_not_allowed')
-    return
-  }
-
   const requestBody: ChatRequest = { ...body, model }
   const isStream = requestBody.stream === true
 
