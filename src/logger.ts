@@ -1,5 +1,11 @@
 const timestamp = () => new Date().toISOString()
 
+let _debugEnabled = process.env.DEBUG === 'true'
+
+export function setDebug(enabled: boolean) {
+  _debugEnabled = enabled
+}
+
 export const logger = {
   info: (message: string, ...args: unknown[]) => {
     console.log(`[${timestamp()}] [INFO] ${message}`, ...args)
@@ -11,8 +17,8 @@ export const logger = {
     console.warn(`[${timestamp()}] [WARN] ${message}`, ...args)
   },
   debug: (message: string, ...args: unknown[]) => {
-    if (process.env.DEBUG === 'true') {
-      console.log(`[${timestamp()}] [DEBUG] ${message}`, ...args)
+    if (_debugEnabled) {
+      console.log(`\x1b[36m[${timestamp()}] [DEBUG] ${message}\x1b[0m`, ...args)
     }
   },
 }
