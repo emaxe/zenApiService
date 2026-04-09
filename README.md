@@ -19,25 +19,59 @@ cp .env.example .env
 ```
 
 ```env
-OPENCODE_API_KEY=sk-...       # ключ от opencode.ai (обязательно)
+OPENCODE_API_KEY=sk-...       # ключ от opencode.ai (обязательно только в MODE=api)
 LOCAL_API_KEY=my-secret-key   # любой секретный ключ для клиентов (обязательно)
 PORT=3000                     # порт сервера (по умолчанию 3000)
 DEFAULT_MODEL=big-pickle      # модель по умолчанию
-ALLOWED_MODELS=big-pickle,minimax-m2.5-free  # ограничить список моделей (необязательно)
+MODE=api                      # api | opencode
+OPENCODE_PORT=54321           # порт локального opencode serve (для MODE=opencode)
+OPENCODE_DIRECTORY=/path/to/project # рабочая директория opencode по умолчанию (необязательно)
+DEBUG=false                   # включить debug-логи
 ```
 
 Получить `OPENCODE_API_KEY` можно на [opencode.ai](https://opencode.ai).
 
 ### 3. Запуск
 
+`MODE=api` (по умолчанию):
+
 ```bash
-npx tsx src/index.ts
+npx tsx src/index.ts --mode api
+```
+
+`MODE=opencode` (локальный `opencode serve` через SDK):
+
+```bash
+npx tsx src/index.ts --mode opencode --opencode-port 54321
 ```
 
 Сервер запустится на `http://localhost:3000`. CLI аргументы переопределяют `.env`:
 
 ```bash
-npx tsx src/index.ts --port 8080 --model minimax-m2.5-free
+npx tsx src/index.ts --port 8080 --model opencode/big-pickle --mode opencode
+```
+
+### Работа с файлами в `MODE=opencode`
+
+Если агент должен читать файлы другого проекта, передай рабочую директорию в запросе:
+
+- через header: `x-opencode-directory: /absolute/path/to/project`
+- или через body: `"opencode_directory": "/absolute/path/to/project"`
+
+Пример:
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -H "x-opencode-directory: /Users/maksimklisin/Desktop/_JS/career-ops" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "stream": true,
+    "messages": [
+      { "role": "user", "content": "О чем файл data/pipeline.md?" }
+    ]
+  }'
 ```
 
 ---
@@ -177,18 +211,19 @@ console.log(response.choices[0].message.content);
 |------|------|---------|
 | 401 | `unauthorized` | Неверный или отсутствующий API ключ |
 | 400 | `invalid_json` | Тело запроса не является валидным JSON |
-| 400 | `model_not_allowed` | Модель не входит в список разрешённых |
+| 400 | `invalid_request_error` | Невалидные поля в запросе (например, `messages`) |
 | 404 | `not_found` | Эндпоинт не существует |
-| 502 | `upstream_error` | Ошибка соединения с opencode.ai |
+| 502 | `upstream_error` / `opencode_error` | Ошибка upstream/opencode |
+| 504 | `timeout` | Таймаут запроса в режиме `opencode` |
 
 Все ошибки возвращаются в формате OpenAI:
 
 ```json
 {
   "error": {
-    "message": "Model 'gpt-4' is not allowed.",
+    "message": "`messages` must be a non-empty array",
     "type": "invalid_request_error",
-    "code": "model_not_allowed"
+    "code": "invalid_request_error"
   }
 }
 ```
@@ -199,9 +234,11 @@ console.log(response.choices[0].message.content);
 
 | Переменная | Обязательно | По умолчанию | Описание |
 |------------|-------------|--------------|----------|
-| `OPENCODE_API_KEY` | ✅ | — | Ключ для upstream opencode.ai |
+| `OPENCODE_API_KEY` | только `MODE=api` | — | Ключ для upstream opencode.ai |
 | `LOCAL_API_KEY` | ✅ | — | Ключ для авторизации клиентов |
 | `PORT` | — | `3000` | Порт сервера |
+| `MODE` | — | `api` | Режим работы: `api` или `opencode` |
 | `DEFAULT_MODEL` | — | `big-pickle` | Модель если не указана в запросе |
-| `ALLOWED_MODELS` | — | все | Список разрешённых моделей через запятую |
+| `OPENCODE_PORT` | — | `54321` | Порт локального `opencode serve` |
+| `OPENCODE_DIRECTORY` | — | cwd сервиса | Рабочая директория opencode по умолчанию |
 | `DEBUG` | — | `false` | Включить debug-логи (`DEBUG=true`) |

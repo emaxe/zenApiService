@@ -6,9 +6,21 @@
 npx tsx src/index.ts
 ```
 
+Для локального режима `opencode`:
+
+```bash
+npx tsx src/index.ts --mode opencode --port 3000 --opencode-port 54321
+```
+
 Во всех примерах используются:
 - `BASE_URL=http://localhost:3000`
 - `API_KEY=my-secret-key` — значение `LOCAL_API_KEY` из твоего `.env`
+
+Для файловых задач в `MODE=opencode` добавляй рабочую директорию проекта:
+
+```bash
+-H "x-opencode-directory: /absolute/path/to/project"
+```
 
 ---
 
@@ -171,6 +183,35 @@ curl http://localhost:3000/v1/chat/completions \
 
 ---
 
+### Работа с файлами (MODE=opencode)
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -H "x-opencode-directory: /Users/maksimklisin/Desktop/_JS/career-ops" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "messages": [
+      { "role": "user", "content": "О чем файл data/pipeline.md?" }
+    ]
+  }'
+```
+
+Альтернатива через body:
+
+```json
+{
+  "model": "opencode/big-pickle",
+  "opencode_directory": "/Users/maksimklisin/Desktop/_JS/career-ops",
+  "messages": [
+    { "role": "user", "content": "О чем файл data/pipeline.md?" }
+  ]
+}
+```
+
+---
+
 ### Streaming (SSE)
 
 **Получить поток чанков:**
@@ -214,23 +255,23 @@ curl http://localhost:3000/v1/chat/completions \
 
 ## Ошибки
 
-**Запрещённая модель → 400:**
+**Невалидные поля запроса → 400:**
 ```bash
 curl http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer my-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4",
-    "messages": [{ "role": "user", "content": "test" }]
+    "model": "big-pickle",
+    "messages": "bad"
   }'
 ```
 
 ```json
 {
   "error": {
-    "message": "Model 'gpt-4' is not allowed. Allowed models: big-pickle, minimax-m2.5-free, gpt-5-nano",
+    "message": "`messages` must be a non-empty array",
     "type": "invalid_request_error",
-    "code": "model_not_allowed"
+    "code": "invalid_request_error"
   }
 }
 ```
