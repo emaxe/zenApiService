@@ -17,11 +17,13 @@ import {
   buildSSEChunk,
   buildSSERoleChunk,
   buildSSEStopChunk,
+  extractContentText,
   extractTextDelta,
   generateCompletionId,
   messagesToParts,
   parseModelString,
   providersToModels,
+  type ContentBlock,
   type OpenAIMessage,
 } from './opencode-mapper.js'
 
@@ -52,7 +54,8 @@ interface AssistantSnapshot {
 interface PromptState {
   model: ResolvedModel
   completionId: string
-  promptText: string
+  /** Text to strip if echoed back by the model. Empty string = no stripping. */
+  echoText: string
   sessionId: string
   directory?: string
 }
@@ -152,8 +155,9 @@ export class OpencodeBackend implements Backend {
 
       if (body.messages.length > 0) {
         const last = body.messages[body.messages.length - 1]
+        const lastContentPreview = extractContentText(last.content).slice(0, 80)
         logger.debug(
-        `[opencode][${requestId}] Chat request: model=${requestedModel}, stream=${isStream}, messages=${body.messages.length}, directory=${directory ?? '(default)'}, last=${last.role}:${last.content.slice(0, 80)}`,
+        `[opencode][${requestId}] Chat request: model=${requestedModel}, stream=${isStream}, messages=${body.messages.length}, directory=${directory ?? '(default)'}, last=${last.role}:${lastContentPreview}`,
         )
       }
 
@@ -173,8 +177,7 @@ export class OpencodeBackend implements Backend {
       const sessionId = session.id
       logger.debug(`[opencode][${requestId}] Created session ${sessionId}`)
 
-      const { parts, system } = messagesToParts(body.messages)
-      const promptText = parts[0]?.text ?? ''
+      const { parts, system, echoText } = messagesToParts(body.messages)
 
       const { stream: eventStream } = await this.client.event.subscribe({
         ...(directory ? { query: { directory } } : {}),
@@ -200,7 +203,7 @@ export class OpencodeBackend implements Backend {
       state = {
         model,
         completionId,
-        promptText,
+        echoText,
         sessionId,
         directory,
       }
@@ -263,7 +266,7 @@ export class OpencodeBackend implements Backend {
     state: PromptState,
     requestId: string,
   ): Promise<void> {
-    const { sessionId, model, completionId, promptText, directory } = state
+    const { sessionId, model, completionId, echoText, directory } = state
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -327,13 +330,13 @@ export class OpencodeBackend implements Backend {
           }
 
           let cleanDelta = textDelta
-          if (!echoStripped && promptText) {
+          if (!echoStripped && echoText) {
             const accumulated = partTextMap.get(part.id) ?? ''
-            if (accumulated.length <= promptText.length) {
+            if (accumulated.length <= echoText.length) {
               continue
             }
-            if (accumulated.length - textDelta.length < promptText.length) {
-              const overlapLen = promptText.length - (accumulated.length - textDelta.length)
+            if (accumulated.length - textDelta.length < echoText.length) {
+              const overlapLen = echoText.length - (accumulated.length - textDelta.length)
               cleanDelta = textDelta.slice(overlapLen).replace(/^\n*/, '')
               echoStripped = true
               if (!cleanDelta) {
@@ -369,7 +372,7 @@ export class OpencodeBackend implements Backend {
 
         if (event.type === 'session.idle' && event.properties.sessionID === sessionId) {
           sessionLastActivityAt = Date.now()
-          const snapshot = await this.getAssistantSnapshot(sessionId, promptText, requestId, directory)
+          const snapshot = await this.getAssistantSnapshot(sessionId, echoText, requestId, directory)
           if (snapshot) {
             finishedReason = snapshot.finishReason
             if (snapshot.content.startsWith(emittedContent)) {
@@ -421,7 +424,7 @@ export class OpencodeBackend implements Backend {
     state: PromptState,
     requestId: string,
   ): Promise<void> {
-    const { sessionId, model, completionId, promptText, directory } = state
+    const { sessionId, model, completionId, echoText, directory } = state
 
     const iterator = eventStream[Symbol.asyncIterator]()
     const partTextMap = new Map<string, string>()
@@ -499,7 +502,7 @@ export class OpencodeBackend implements Backend {
       return
     }
 
-    const snapshot = await this.getAssistantSnapshot(sessionId, promptText, requestId, directory)
+    const snapshot = await this.getAssistantSnapshot(sessionId, echoText, requestId, directory)
     if (snapshot) {
       sendJson(
         res,
@@ -516,7 +519,7 @@ export class OpencodeBackend implements Backend {
     }
 
     let fallbackContent = Array.from(partTextMap.values()).join('')
-    fallbackContent = this.stripPromptEcho(fallbackContent, promptText)
+    fallbackContent = this.stripEchoText(fallbackContent, echoText)
     sendJson(res, 200, buildChatResponse(fallbackContent, model.responseModel, completionId))
   }
 
@@ -543,8 +546,22 @@ export class OpencodeBackend implements Backend {
       if (role !== 'system' && role !== 'user' && role !== 'assistant') {
         return `messages[${idx}].role must be one of: system, user, assistant`
       }
-      if (typeof content !== 'string') {
-        return `messages[${idx}].content must be a string`
+      // content may be a plain string OR an array of content blocks
+      // (agents using the OpenAI multi-part / vision format send arrays)
+      if (typeof content === 'string') {
+        // valid — nothing to do
+      } else if (Array.isArray(content)) {
+        // Each element must be an object with at least a `type` field
+        for (const [blockIdx, block] of (content as unknown[]).entries()) {
+          if (!block || typeof block !== 'object' || Array.isArray(block)) {
+            return `messages[${idx}].content[${blockIdx}] must be an object`
+          }
+          if (typeof (block as ContentBlock).type !== 'string') {
+            return `messages[${idx}].content[${blockIdx}].type must be a string`
+          }
+        }
+      } else {
+        return `messages[${idx}].content must be a string or array of content blocks`
       }
     }
 
@@ -617,7 +634,7 @@ export class OpencodeBackend implements Backend {
 
   private async getAssistantSnapshot(
     sessionId: string,
-    promptText: string,
+    echoText: string,
     requestId: string,
     directory?: string,
   ): Promise<AssistantSnapshot | null> {
@@ -647,7 +664,7 @@ export class OpencodeBackend implements Backend {
         .map(part => part.text)
         .join('')
 
-      const content = this.stripPromptEcho(text, promptText)
+      const content = this.stripEchoText(text, echoText)
       const promptTokens = candidate.info.tokens?.input ?? 0
       const completionTokens = candidate.info.tokens?.output ?? 0
       return {
@@ -664,12 +681,12 @@ export class OpencodeBackend implements Backend {
     return null
   }
 
-  private stripPromptEcho(content: string, promptText: string): string {
-    if (!promptText) {
+  private stripEchoText(content: string, echoText: string): string {
+    if (!echoText) {
       return content
     }
-    if (content.startsWith(promptText)) {
-      return content.slice(promptText.length).replace(/^\n+/, '')
+    if (content.startsWith(echoText)) {
+      return content.slice(echoText.length).replace(/^\n+/, '')
     }
     return content
   }
@@ -758,7 +775,12 @@ export class OpencodeBackend implements Backend {
       ?? this.readHeaderValue(req, 'x-working-directory')
       ?? this.readHeaderValue(req, 'x-cwd')
 
-    const raw = fromBody || fromHeader || this.defaultDirectory || ''
+    // Fallback: parse CWD hints from system/user messages.
+    // AI agents (e.g. OpenCode in agent mode) often embed their working directory
+    // in the system prompt with patterns like "cwd: /path" or "Working directory: /path".
+    const fromMessages = fromBody || fromHeader ? '' : this.extractDirectoryFromMessages(body.messages)
+
+    const raw = fromBody || fromHeader || this.defaultDirectory || fromMessages || ''
     if (!raw) {
       return undefined
     }
@@ -772,8 +794,50 @@ export class OpencodeBackend implements Backend {
       await access(candidate)
       return candidate
     } catch {
+      // Directory hint from messages may be wrong — treat as soft failure
+      if (!fromBody && !fromHeader && !this.defaultDirectory && fromMessages) {
+        logger.debug(`[opencode] Ignoring unresolvable directory hint from messages: ${candidate}`)
+        return undefined
+      }
       throw new ClientInputError(`Directory does not exist or is not accessible: ${candidate}`)
     }
+  }
+
+  /**
+   * Try to extract an absolute directory path from message content.
+   * Looks for common patterns AI agents use to indicate their CWD.
+   */
+  private extractDirectoryFromMessages(messages: OpenAIMessage[]): string {
+    // Patterns: "cwd: /path", "Working directory: /path", "Current directory: /path", etc.
+    const patterns = [
+      /\bcwd[:\s]+(\/.+?)(?:\n|$)/i,
+      /\bworking directory[:\s]+(\/.+?)(?:\n|$)/i,
+      /\bcurrent directory[:\s]+(\/.+?)(?:\n|$)/i,
+      /\bdirectory[:\s]+(\/.+?)(?:\n|$)/i,
+      /\bproject(?:\s+(?:root|dir(?:ectory)?))?[:\s]+(\/.+?)(?:\n|$)/i,
+    ]
+
+    // Check system messages first (most authoritative), then user messages
+    const orderedMessages = [
+      ...messages.filter(m => m.role === 'system'),
+      ...messages.filter(m => m.role === 'user'),
+    ]
+
+    for (const msg of orderedMessages) {
+      const text = extractContentText(msg.content)
+      for (const pattern of patterns) {
+        const match = pattern.exec(text)
+        if (match?.[1]) {
+          const candidate = match[1].trim().replace(/["'`]/g, '')
+          if (candidate.startsWith('/')) {
+            logger.debug(`[opencode] Extracted directory hint from messages: ${candidate}`)
+            return candidate
+          }
+        }
+      }
+    }
+
+    return ''
   }
 
   private readHeaderValue(req: IncomingMessage, name: string): string | undefined {

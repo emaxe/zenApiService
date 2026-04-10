@@ -6,11 +6,34 @@ import type {
 } from '@opencode-ai/sdk'
 
 /**
- * OpenAI message format (incoming request)
+ * OpenAI content block (used in multi-part messages)
+ */
+export interface ContentBlock {
+  type: string
+  text?: string
+  [key: string]: unknown
+}
+
+/**
+ * OpenAI message format (incoming request).
+ * `content` may be a plain string or an array of content blocks
+ * (as sent by agents using the OpenAI vision / multi-part format).
  */
 export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant'
-  content: string
+  content: string | ContentBlock[]
+}
+
+/**
+ * Normalise a message's content to a plain string.
+ * Array content blocks are concatenated by their `text` fields.
+ */
+export function extractContentText(content: string | ContentBlock[]): string {
+  if (typeof content === 'string') return content
+  return content
+    .filter(block => block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text as string)
+    .join('')
 }
 
 /**
@@ -25,45 +48,52 @@ export interface OpenAIMessage {
 export function messagesToParts(messages: OpenAIMessage[]): {
   parts: TextPartInput[]
   system: string | undefined
+  /**
+   * Text to strip from the beginning of the response if the model echoes it back.
+   * Empty string means no echo-stripping (used for multi-turn conversations
+   * where the full history prompt is never echoed).
+   */
+  echoText: string
 } {
   const systemParts: string[] = []
-  const conversationParts: string[] = []
 
   for (const msg of messages) {
     if (msg.role === 'system') {
-      systemParts.push(msg.content)
-    } else if (msg.role === 'user') {
-      conversationParts.push(msg.content)
-    } else if (msg.role === 'assistant') {
-      conversationParts.push(`[Assistant's previous response]: ${msg.content}`)
+      systemParts.push(extractContentText(msg.content))
     }
   }
 
-  // If there's only one user message and no assistant messages, send it directly
   const hasHistory = messages.some(m => m.role === 'assistant')
+  const lastUser = messages.filter(m => m.role === 'user').pop()
+  const lastUserText = lastUser ? extractContentText(lastUser.content) : ''
+
   let promptText: string
 
   if (hasHistory) {
-    // Build a conversation-style prompt so opencode understands the context
+    // Build a conversation-style prompt so opencode understands the context.
+    // echoText = '' because the model will never echo this long formatted wrapper.
     const formattedParts: string[] = []
     for (const msg of messages) {
       if (msg.role === 'system') continue
+      const text = extractContentText(msg.content)
       if (msg.role === 'user') {
-        formattedParts.push(`[User]: ${msg.content}`)
+        formattedParts.push(`[User]: ${text}`)
       } else if (msg.role === 'assistant') {
-        formattedParts.push(`[Assistant]: ${msg.content}`)
+        formattedParts.push(`[Assistant]: ${text}`)
       }
     }
     promptText = `Here is our conversation so far:\n\n${formattedParts.join('\n\n')}\n\nPlease continue the conversation by responding to the latest [User] message.`
   } else {
     // Single user message — send as-is
-    const lastUser = messages.filter(m => m.role === 'user').pop()
-    promptText = lastUser?.content ?? ''
+    promptText = lastUserText
   }
 
   return {
     parts: [{ type: 'text' as const, text: promptText }],
     system: systemParts.length > 0 ? systemParts.join('\n\n') : undefined,
+    // For multi-turn, never strip echo (the history wrapper is never echoed back).
+    // For single-turn, strip only if the model echoes the user message verbatim.
+    echoText: hasHistory ? '' : lastUserText,
   }
 }
 
