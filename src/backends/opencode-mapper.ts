@@ -45,7 +45,7 @@ export function extractContentText(content: string | ContentBlock[]): string {
  * - system messages → concatenated into `system` parameter
  * - user + assistant messages → formatted as conversation history in a single TextPartInput
  */
-export function messagesToParts(messages: OpenAIMessage[]): {
+export function messagesToParts(messages: OpenAIMessage[], echoTextOverride?: string): {
   parts: TextPartInput[]
   system: string | undefined
   /**
@@ -93,7 +93,8 @@ export function messagesToParts(messages: OpenAIMessage[]): {
     system: systemParts.length > 0 ? systemParts.join('\n\n') : undefined,
     // For multi-turn, never strip echo (the history wrapper is never echoed back).
     // For single-turn, strip only if the model echoes the user message verbatim.
-    echoText: hasHistory ? '' : lastUserText,
+    // Use override if provided (from EchoDetector).
+    echoText: echoTextOverride !== undefined ? echoTextOverride : (hasHistory ? '' : lastUserText),
   }
 }
 

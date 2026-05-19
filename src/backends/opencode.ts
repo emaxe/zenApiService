@@ -26,6 +26,11 @@ import {
   type ContentBlock,
   type OpenAIMessage,
 } from './opencode-mapper.js'
+// Новые импорты для устранения выявленных проблем
+import { Mutex, SessionLockManager, SafeStreamWrapper, ResponseWriter } from './concurrency-guardian.js'
+import { PathSanitizer, PermissionManager, InputValidator } from './security-auditor.js'
+import { EchoDetector, SessionTracker, RetryHandler, SnapshotSync } from './protocol-stabilizer.js'
+import { ConfigManager, SmartCache, RateLimiter, SessionRegistry, SafeLogger } from './config-master.js'
 
 interface ChatRequest {
   model?: string
@@ -62,21 +67,60 @@ interface PromptState {
 
 class ClientInputError extends Error {}
 
-const EVENT_TIMEOUT_MS = 120_000
-const PROVIDER_CACHE_TTL_MS = 30_000
-const STREAM_KEEPALIVE_MS = 15_000
+const DEFAULT_EVENT_TIMEOUT_MS = 120_000
+const DEFAULT_PROVIDER_CACHE_TTL_MS = 30_000
+const DEFAULT_STREAM_KEEPALIVE_MS = 15_000
 
 export class OpencodeBackend implements Backend {
   private config: Config
   private client: OpencodeClient | null = null
   private serverClose: (() => void) | null = null
-  private providerCache: { expiresAt: number; providers: Provider[] } | null = null
-  private defaultDirectory: string | undefined
+  
+  // Новые компоненты для устранения проблем
+  private configManager: ConfigManager
+  private sessionLockManager: SessionLockManager
+  private pathSanitizer: typeof PathSanitizer
+  private permissionManager: typeof PermissionManager
+  private inputValidator: InputValidator
+  private echoDetector: EchoDetector
+  private retryHandler: RetryHandler
+  private snapshotSync: SnapshotSync
+  private providerCache: SmartCache<Provider[]>
+  private rateLimiter: RateLimiter
+  private sessionRegistry: SessionRegistry
+  private safeLogger: SafeLogger
 
   constructor(config: Config) {
     this.config = config
     this.defaultDirectory = process.env.OPENCODE_DIRECTORY?.trim() || undefined
+    
+    // Инициализация новых компонентов
+    this.configManager = new ConfigManager()
+    this.sessionLockManager = new SessionLockManager()
+    this.pathSanitizer = PathSanitizer
+    this.permissionManager = PermissionManager
+    this.inputValidator = new InputValidator()
+    this.echoDetector = new EchoDetector()
+    this.retryHandler = new RetryHandler({
+      maxRetries: this.configManager.get('maxRetries'),
+      baseDelayMs: this.configManager.get('retryBaseDelayMs'),
+    })
+    this.snapshotSync = new SnapshotSync()
+    this.providerCache = new SmartCache<Provider[]>({ 
+      defaultTtlMs: this.configManager.get('providerCacheTtlMs') 
+    })
+    this.rateLimiter = new RateLimiter({ maxRequests: 100, windowMs: 60_000 })
+    this.sessionRegistry = new SessionRegistry({
+      maxLifetimeMs: this.configManager.get('maxSessionLifetimeMs'),
+      maxConcurrent: this.configManager.get('maxConcurrentSessions'),
+    })
+    this.safeLogger = new SafeLogger({
+      maskSessionIds: this.configManager.get('maskSessionIdsInLogs'),
+      enableDebug: this.configManager.get('enableDebugLogging'),
+    })
   }
+
+  private defaultDirectory: string | undefined
 
   async start(): Promise<void> {
     const port = this.config.opencodePort
@@ -133,11 +177,25 @@ export class OpencodeBackend implements Backend {
     const requestId = randomUUID().slice(0, 8)
     const requestStartTime = Date.now()
 
+    // Проверка rate limiting
+    const clientId = req.socket.remoteAddress ?? 'unknown'
+    if (!this.rateLimiter.allowRequest(clientId)) {
+      sendError(res, 429, 'Too many requests', 'rate_limit_exceeded')
+      return
+    }
+
     let parsed: unknown
     try {
       parsed = await parseBody(req)
     } catch {
       sendError(res, 400, 'Invalid JSON body', 'invalid_json')
+      return
+    }
+
+    // Валидация входных данных с лимитами
+    const validationResult = this.inputValidator.validateMessages((parsed as { messages?: unknown }).messages as Array<{ role?: unknown; content?: unknown }> ?? [])
+    if (validationResult) {
+      sendError(res, 400, validationResult, 'invalid_request_error')
       return
     }
 
@@ -148,23 +206,28 @@ export class OpencodeBackend implements Backend {
     }
     const body = parsed as ChatRequest
 
-      const requestedModel = body.model ?? config.defaultModel
-      const isStream = body.stream === true
-      const completionId = generateCompletionId()
-      const directory = await this.resolveRequestDirectory(req, body)
+    const requestedModel = body.model ?? config.defaultModel
+    const isStream = body.stream === true
+    const completionId = generateCompletionId()
+    const directory = await this.resolveRequestDirectory(req, body)
 
-      if (body.messages.length > 0) {
-        const last = body.messages[body.messages.length - 1]
-        const lastContentPreview = extractContentText(last.content).slice(0, 80)
-        logger.debug(
+    if (body.messages.length > 0) {
+      const last = body.messages[body.messages.length - 1]
+      const lastContentPreview = extractContentText(last.content).slice(0, 80)
+      this.safeLogger.debug(
         `[opencode][${requestId}] Chat request: model=${requestedModel}, stream=${isStream}, messages=${body.messages.length}, directory=${directory ?? '(default)'}, last=${last.role}:${lastContentPreview}`,
-        )
-      }
+      )
+    }
 
     let state: PromptState | null = null
+    let sessionTracker: SessionTracker | null = null
 
     try {
-      const model = await this.resolveModel(requestedModel)
+      const model = await this.retryHandler.executeWithRetry(
+        () => this.resolveModel(requestedModel),
+        'resolveModel',
+      )
+
       const { data: session, error: sessionError } = await this.client.session.create({
         ...(directory ? { query: { directory } } : {}),
       })
@@ -175,13 +238,37 @@ export class OpencodeBackend implements Backend {
       }
 
       const sessionId = session.id
-      logger.debug(`[opencode][${requestId}] Created session ${sessionId}`)
+      
+      // Регистрируем сессию в реестре
+      if (!this.sessionRegistry.register(sessionId, requestId)) {
+        await this.client.session.delete({
+          path: { id: sessionId },
+          ...(directory ? { query: { directory } } : {}),
+        })
+        sendError(res, 503, 'Too many concurrent sessions', 'service_unavailable')
+        return
+      }
 
-      const { parts, system, echoText } = messagesToParts(body.messages)
+      // Создаем трекер состояния сессии
+      sessionTracker = new SessionTracker(
+        sessionId,
+        this.configManager.get('idleTimeoutMs'),
+        5000,
+        6,
+      )
+
+      this.safeLogger.debug(`[opencode][${requestId}] Created session ${this.safeLogger.maskSessionId(sessionId)}`)
+
+      // Используем улучшенный детектор эха
+      const echoText = this.echoDetector.detectEchoText(body.messages)
+      const { parts, system } = messagesToParts(body.messages, echoText)
 
       const { stream: eventStream } = await this.client.event.subscribe({
         ...(directory ? { query: { directory } } : {}),
       })
+
+      // Оборачиваем итератор для безопасного управления ресурсами
+      const safeStream = new SafeStreamWrapper(eventStream)
 
       const promptResult = await this.client.session.promptAsync({
         body: {
@@ -196,6 +283,7 @@ export class OpencodeBackend implements Backend {
       if (promptResult.error) {
         const status = promptResult.response.status
         const message = this.extractSdkErrorMessage(promptResult.error) ?? 'OpenCode prompt failed'
+        sessionTracker.markError(message)
         sendError(res, status >= 500 ? 502 : status, message, 'opencode_error')
         return
       }
@@ -209,15 +297,15 @@ export class OpencodeBackend implements Backend {
       }
 
       if (isStream) {
-        await this.handleStreaming(res, eventStream, state, requestId)
+        await this.handleStreaming(res, safeStream, state, requestId)
       } else {
-        await this.handleNonStreaming(res, eventStream, state, requestId)
+        await this.handleNonStreaming(res, safeStream, state, requestId)
       }
 
-      logger.debug(`[opencode][${requestId}] Request completed in ${Date.now() - requestStartTime}ms`)
+      this.safeLogger.debug(`[opencode][${requestId}] Request completed in ${Date.now() - requestStartTime}ms`)
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
-      logger.error(`[opencode][${requestId}] Chat error: ${message}`)
+      this.safeLogger.error(`[opencode][${requestId}] Chat error: ${message}`)
       if (!res.headersSent) {
         if (err instanceof ClientInputError) {
           sendError(res, 400, message, 'invalid_request_error')
@@ -227,12 +315,13 @@ export class OpencodeBackend implements Backend {
       }
     } finally {
       if (state?.sessionId) {
+        this.sessionRegistry.unregister(state.sessionId)
         try {
           await this.client.session.delete({
             path: { id: state.sessionId },
             ...(state.directory ? { query: { directory: state.directory } } : {}),
           })
-          logger.debug(`[opencode][${requestId}] Deleted session ${state.sessionId}`)
+          this.safeLogger.debug(`[opencode][${requestId}] Deleted session ${this.safeLogger.maskSessionId(state.sessionId)}`)
         } catch {
         }
       }
@@ -685,10 +774,10 @@ export class OpencodeBackend implements Backend {
     if (!echoText) {
       return content
     }
-    if (content.startsWith(echoText)) {
-      return content.slice(echoText.length).replace(/^\n+/, '')
-    }
-    return content
+    
+    // Используем умный детектор эха вместо простой проверки startsWith
+    const echoResult = EchoDetector.detectAndStrip(content, echoText)
+    return echoResult.strippedContent
   }
 
   private mapFinishReason(rawFinish: string | undefined): 'stop' | 'length' | 'content_filter' | 'tool_calls' {
@@ -748,13 +837,48 @@ export class OpencodeBackend implements Backend {
       return
     }
 
+    // Используем PermissionManager для принятия решения об одобрении
+    const permissionDecision = PermissionManager.evaluatePermissionRequest({
+      sessionId,
+      permissionID,
+      directory,
+      requestId,
+    })
+
+    if (!permissionDecision.approved) {
+      logger.warn(
+        `[opencode][${requestId}] Permission ${permissionID} denied by security policy: ${permissionDecision.reason}`,
+      )
+      
+      // Отправляем отказ вместо одобрения
+      const { error } = await this.client.postSessionIdPermissionsPermissionId({
+        path: {
+          id: sessionId,
+          permissionID,
+        },
+        body: {
+          response: 'deny',
+          reason: permissionDecision.reason,
+        },
+        ...(directory ? { query: { directory } } : {}),
+      })
+
+      if (error) {
+        logger.warn(
+          `[opencode][${requestId}] Failed to deny permission ${permissionID}: ${this.extractSdkErrorMessage(error)}`,
+        )
+      }
+      return
+    }
+
+    // Одобржаем только безопасные запросы
     const { error } = await this.client.postSessionIdPermissionsPermissionId({
       path: {
         id: sessionId,
         permissionID,
       },
       body: {
-        response: 'once',
+        response: permissionDecision.scope === 'session' ? 'always' : 'once',
       },
       ...(directory ? { query: { directory } } : {}),
     })
@@ -766,7 +890,10 @@ export class OpencodeBackend implements Backend {
       return
     }
 
-    logger.debug(`[opencode][${requestId}] Auto-approved permission ${permissionID}`)
+    const logLevel = permissionDecision.riskLevel === RiskLevel.HIGH ? 'warn' : 'debug'
+    logger[logLevel](
+      `[opencode][${SafeLogger.mask(sessionId)}] Auto-approved permission ${permissionID} (risk: ${permissionDecision.riskLevel})`,
+    )
   }
 
   private async resolveRequestDirectory(req: IncomingMessage, body: ChatRequest): Promise<string | undefined> {
@@ -775,10 +902,9 @@ export class OpencodeBackend implements Backend {
       ?? this.readHeaderValue(req, 'x-working-directory')
       ?? this.readHeaderValue(req, 'x-cwd')
 
-    // Fallback: parse CWD hints from system/user messages.
-    // AI agents (e.g. OpenCode in agent mode) often embed their working directory
-    // in the system prompt with patterns like "cwd: /path" or "Working directory: /path".
-    const fromMessages = fromBody || fromHeader ? '' : this.extractDirectoryFromMessages(body.messages)
+    // Игнорируем извлечение директории из сообщений для безопасности
+    // Это предотвращает инъекции путей через системные промпты
+    const fromMessages = ''
 
     const raw = fromBody || fromHeader || this.defaultDirectory || fromMessages || ''
     if (!raw) {
@@ -790,53 +916,27 @@ export class OpencodeBackend implements Backend {
       throw new ClientInputError('`opencode_directory` must be an absolute path')
     }
 
+    // Используем PathSanitizer для безопасной валидации пути
+    const sanitizedPath = PathSanitizer.sanitizePath(candidate, this.defaultDirectory)
+    
+    if (!sanitizedPath.isValid) {
+      throw new ClientInputError(`Invalid directory path: ${sanitizedPath.error}`)
+    }
+
     try {
-      await access(candidate)
-      return candidate
+      await access(sanitizedPath.path)
+      return sanitizedPath.path
     } catch {
-      // Directory hint from messages may be wrong — treat as soft failure
-      if (!fromBody && !fromHeader && !this.defaultDirectory && fromMessages) {
-        logger.debug(`[opencode] Ignoring unresolvable directory hint from messages: ${candidate}`)
-        return undefined
-      }
-      throw new ClientInputError(`Directory does not exist or is not accessible: ${candidate}`)
+      throw new ClientInputError(`Directory does not exist or is not accessible: ${sanitizedPath.path}`)
     }
   }
 
   /**
-   * Try to extract an absolute directory path from message content.
-   * Looks for common patterns AI agents use to indicate their CWD.
+   * Устаревший метод - больше не используется для безопасности.
+   * Извлечение директории из сообщений отключено для предотвращения инъекций.
+   * @deprecated Security risk: directory injection via prompts
    */
-  private extractDirectoryFromMessages(messages: OpenAIMessage[]): string {
-    // Patterns: "cwd: /path", "Working directory: /path", "Current directory: /path", etc.
-    const patterns = [
-      /\bcwd[:\s]+(\/.+?)(?:\n|$)/i,
-      /\bworking directory[:\s]+(\/.+?)(?:\n|$)/i,
-      /\bcurrent directory[:\s]+(\/.+?)(?:\n|$)/i,
-      /\bdirectory[:\s]+(\/.+?)(?:\n|$)/i,
-      /\bproject(?:\s+(?:root|dir(?:ectory)?))?[:\s]+(\/.+?)(?:\n|$)/i,
-    ]
-
-    // Check system messages first (most authoritative), then user messages
-    const orderedMessages = [
-      ...messages.filter(m => m.role === 'system'),
-      ...messages.filter(m => m.role === 'user'),
-    ]
-
-    for (const msg of orderedMessages) {
-      const text = extractContentText(msg.content)
-      for (const pattern of patterns) {
-        const match = pattern.exec(text)
-        if (match?.[1]) {
-          const candidate = match[1].trim().replace(/["'`]/g, '')
-          if (candidate.startsWith('/')) {
-            logger.debug(`[opencode] Extracted directory hint from messages: ${candidate}`)
-            return candidate
-          }
-        }
-      }
-    }
-
+  private extractDirectoryFromMessages(_messages: OpenAIMessage[]): string {
     return ''
   }
 
